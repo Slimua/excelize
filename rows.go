@@ -211,6 +211,15 @@ func (err ErrSheetNotExist) Error() string {
 	return fmt.Sprintf("sheet %s does not exist", err.SheetName)
 }
 
+// ErrCountRows defines an error of count rows
+type ErrCountRows struct {
+	err error
+}
+
+func (err ErrCountRows) Error() string {
+	return fmt.Sprintf("wrong count rows: %s", err.err.Error())
+}
+
 // rowXMLIterator defined runtime use field for the worksheet row SAX parser.
 type rowXMLIterator struct {
 	err              error
@@ -234,6 +243,80 @@ func (rows *Rows) rowXMLHandler(rowIterator *rowXMLIterator, xmlElement *xml.Sta
 		if val, _ := colCell.getValueFrom(rows.f, rows.sst, raw); val != "" || colCell.F != nil {
 			rowIterator.cells = append(appendSpace(blank, rowIterator.cells), val)
 		}
+	}
+}
+
+// CountRows returns the number of rows in the worksheet.
+// if return -1, that row not found
+func (f *File) CountRows(sheet string) (int64, error) {
+	name, ok := f.getSheetXMLPath(sheet)
+	if !ok {
+		return -1, ErrSheetNotExist{sheet}
+	}
+
+	needClose, reader, tempFile, readerSize, err := f.contentReader(name)
+	if err != nil {
+		return -1, ErrCountRows{fmt.Errorf("content reader: %v", err)}
+	}
+	if needClose && err == nil {
+		defer tempFile.Close()
+	}
+
+	var (
+		index    int
+		buffSize int64 = 1024
+		buff           = make([]byte, buffSize)
+		cursor         = readerSize - buffSize
+	)
+
+	for {
+		if cursor < 0 {
+			cursor = 0
+		}
+
+		if _, err = reader.ReadAt(buff, cursor); err != nil && err != io.EOF {
+			return -1, ErrCountRows{fmt.Errorf("read at: %v", err)}
+		}
+
+		index = bytes.LastIndex(buff, []byte(`<row`))
+		if index == -1 {
+			if cursor == 0 {
+				return -1, ErrCountRows{fmt.Errorf("not found row number (before)")}
+			}
+			cursor -= buffSize / 2
+			continue
+		}
+		cursor += int64(index)
+		break
+	}
+
+	for {
+		if cursor > readerSize {
+			return -1, ErrCountRows{fmt.Errorf("not found row number (after)")}
+		}
+
+		if _, err = reader.ReadAt(buff, cursor); err != nil && err != io.EOF {
+			return -1, ErrCountRows{fmt.Errorf("read at: %v", err)}
+		}
+
+		index = bytes.Index(buff, []byte(` r="`))
+		if index == -1 {
+			cursor += buffSize / 2
+			continue
+		}
+
+		if _, err = reader.ReadAt(buff, cursor+int64(index)+4); err != nil && err != io.EOF {
+			return -1, ErrCountRows{fmt.Errorf("read at: %v", err)}
+		}
+
+		index = bytes.Index(buff, []byte(`"`))
+		if index == -1 {
+			return -1, ErrCountRows{fmt.Errorf("not found row number")}
+		}
+
+		countStr := string(buff[:index])
+
+		return strconv.ParseInt(countStr, 10, 64)
 	}
 }
 
@@ -331,19 +414,38 @@ func (f *File) getFromStringItem(index int) string {
 	return f.getFromStringItem(index)
 }
 
-// xmlDecoder creates XML decoder by given path in the zip from memory data
+type ReaderContent interface {
+	io.Reader
+	io.ReaderAt
+}
+
+// contentReader returns reader by given path in the zip from memory data
 // or system temporary file.
-func (f *File) xmlDecoder(name string) (bool, *xml.Decoder, *os.File, error) {
+func (f *File) contentReader(name string) (bool, ReaderContent, *os.File, int64, error) {
 	var (
 		content  []byte
 		err      error
 		tempFile *os.File
 	)
 	if content = f.readXML(name); len(content) > 0 {
-		return false, f.xmlNewDecoder(bytes.NewReader(content)), tempFile, err
+		return false, bytes.NewReader(content), tempFile, int64(len(content)), err
 	}
+
 	tempFile, err = f.readTemp(name)
-	return true, f.xmlNewDecoder(tempFile), tempFile, err
+
+	fileStat, err := tempFile.Stat()
+	if err != nil {
+		return true, tempFile, tempFile, 0, fmt.Errorf("failed to get file stat: %w", err)
+	}
+
+	return true, tempFile, tempFile, fileStat.Size(), err
+}
+
+// xmlDecoder creates XML decoder by given path in the zip from memory data
+// or system temporary file.
+func (f *File) xmlDecoder(name string) (bool, *xml.Decoder, *os.File, error) {
+	needClose, reader, tempFile, _, err := f.contentReader(name)
+	return needClose, f.xmlNewDecoder(reader), tempFile, err
 }
 
 // SetRowHeight provides a function to set the height of a single row. For
